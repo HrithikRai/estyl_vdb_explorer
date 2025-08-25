@@ -361,8 +361,7 @@ else:
                 limit=limit,
                 offset=st.session_state.offset,
                 filters=filters,
-                rerank_query=rerank_query,
-                rerank_prop=rerank_prop,
+
             )
                 if objs:
                     # Pick the first unseen

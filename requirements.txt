@@ -1,7 +1,7 @@
-numpy==2.3.2
-Pillow==11.3.0
-python-dotenv==1.1.1
-streamlit==1.48.1
-torch==2.8.0
-transformers==4.55.4
-weaviate==0.1.2
+numpy
+Pillow
+python-dotenv
+streamlit
+torch
+transformers
+weaviate-client
