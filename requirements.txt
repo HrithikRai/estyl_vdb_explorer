@@ -6,4 +6,4 @@ torch
 transformers
 weaviate-client
 openai
-json
+
