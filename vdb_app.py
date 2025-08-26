@@ -12,7 +12,8 @@ import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter
 from weaviate.classes.query import MetadataQuery
-import openai, json
+import openai
+import json
 # =============================================================
 # Config & Caching
 # =============================================================
