@@ -12,7 +12,7 @@ import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter
 from weaviate.classes.query import MetadataQuery
-
+import openai, json
 # =============================================================
 # Config & Caching
 # =============================================================
@@ -279,7 +279,7 @@ def fashionclip_rerank(objs, query_text: str, query_img_bytes: Optional[bytes]):
     texts = [compose_rerank_text(o.properties or {}) for o in objs]
 
     # Encode candidate texts as a batch (FashionCLIP text features)
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+    tokenizer = CLIPTokenizer.from_pretrained("patrickjohncyh/fashion-clip")
     text_inputs = tokenizer(
         texts,
         padding=True,
@@ -335,8 +335,6 @@ def fashionclip_rerank(objs, query_text: str, query_img_bytes: Optional[bytes]):
     order = np.argsort(-sims_np)
     return [objs[i] for i in order]
 
-
-
 def do_hybrid_search(
     client: weaviate.WeaviateClient,
     text_query: str,
@@ -354,7 +352,7 @@ def do_hybrid_search(
         target_vector = "image_vector"
     else:
         # Text only → keyword-heavy; keep closer to 0 while respecting user slider
-        effective_alpha = min(alpha, 0.15)
+        effective_alpha = 0
         primary_vec = text_vec
         target_vector = "text_vector"
 
@@ -528,192 +526,324 @@ if mode == "Single Items":
             result_cards(objs, cols=4, add_to_seen=True)
 
 # =============================================================
-# Mode: Outfit Builder  (fixed: one block only; only shown when mode == "Outfit Builder")
+# Mode: Outfit Builder  (fixed: robust planner + fast retrieval + budgeted assembly)
 # =============================================================
 else:
-    st.write("Build complete looks that obey your budget tier + total budget. (LLM-assisted composing)")
+    st.write("Build complete looks that obey your budget tier + total budget. (Planner-optional composing)")
 
     num_outfits = st.slider("How many outfits?", 1, 6, 3, 1)
-    articles = st.slider("Articles per outfit", 2, 5, 3, 1,
-                         help="2→Tops+Bottoms; 3→+Shoes; 4→+Outerwear; ≥5→+Accessory")
-    per_cat_candidates = st.slider("Per-category candidates", 1, 10, 5, 1,
-                                   help="How many results to fetch per category before picking")
-    build_btn = st.button("Compose Outfits (LLM)", type="primary")
+    articles = st.slider(
+        "Articles per outfit", 2, 5, 3, 1,
+        help="2→Tops+Bottoms; 3→+Shoes; 4→+Outerwear; ≥5→+Accessory"
+    )
+    per_cat_candidates = st.slider(
+        "Per-category candidates", 1, 10, 5, 1,
+        help="How many results to fetch per category before picking"
+    )
+    build_btn = st.button("Compose Outfits", type="primary")
 
-    # Helpers
+    # --- Helpers specific to Outfit Builder ---
+    import itertools
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     def price_bounds_for(cat: str, tier: str) -> Tuple[Optional[float], Optional[float]]:
         if cat not in BUDGET_TIERS:
             return None, None
         return BUDGET_TIERS[cat][tier]
 
-    def build_category_filters(cat: str) -> Filter:
+    def build_category_filters(cat: str, extra_price_cap: Optional[float] = None) -> Filter:
         lo, hi = price_bounds_for(cat, selected_tier)
+        # Optional tighter cap per category (from budget split)
+        if extra_price_cap is not None:
+            hi = min(hi, extra_price_cap) if hi is not None else extra_price_cap
         return build_filters(
             gender=None if gender == "any" else gender,
             categories=[cat],
             price_min=lo,
             price_max=hi,
-            brand_substr=brand_filter.strip() or None,
+            brand_substr=(brand_filter.strip() or None),
         )
 
-    import json, re, textwrap, time
+    # Map free-form keys to canonical category names used in Weaviate
+    _CAT_SYNONYMS = {
+        "tops": "Tops", "shirt": "Tops", "t-shirt": "Tops", "tee": "Tops", "blouse": "Tops",
+        "bottoms": "Bottoms", "pants": "Bottoms", "trousers": "Bottoms", "jeans": "Bottoms", "skirt": "Bottoms", "shorts": "Bottoms",
+        "shoes": "Shoes", "sneakers": "Shoes", "boots": "Shoes", "heels": "Shoes", "sandals": "Shoes", "loafers": "Shoes",
+        "outerwear": "Outerwear", "jacket": "Outerwear", "coat": "Outerwear", "blazer": "Outerwear", "hoodie": "Outerwear",
+        "accessories": "Accessories", "watch": "Accessories", "belt": "Accessories", "hat": "Accessories",
+        "scarf": "Accessories", "sunglasses": "Accessories", "glasses": "Accessories", "tie": "Accessories",
+    }
 
-    def try_parse_json(s: str):
-        s = s.strip()
+    def canonicalize_category(s: str) -> Optional[str]:
+        if not s:
+            return None
+        k = str(s).strip().lower()
+        return _CAT_SYNONYMS.get(k, s) if s in CATEGORY_OPTIONS else _CAT_SYNONYMS.get(k, None)
+
+    def lm_fallback_plan(num_outfits, cats, text_query, brand_hint):
+        """Deterministic local plan that guarantees canonical categories."""
+        plans = []
+        base = (text_query or "").strip()
+        for _ in range(num_outfits):
+            plan = {}
+            for c in cats:
+                q = " ".join([w for w in [base, c, brand_hint.strip() if brand_hint else None] if w])
+                plan[c] = q
+            plans.append(plan)
+        return plans
+
+    def call_llm_plan_safe(event, categories, budget, style_prefs, num_outfits=1):
+        """Try OpenAI planner; fall back to None if not configured/usable."""
         try:
-            return json.loads(s)
-        except Exception:
-            pass
-        m = re.search(r"(\{.*\}|\[.*\])", s, flags=re.S)
-        if m:
+            # Prefer OpenAI v1 client if available
             try:
-                return json.loads(m.group(1))
+                from openai import OpenAI
+                _client = OpenAI()
+                resp = _client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You output only valid JSON: a LIST of outfit objects keyed by your provided categories."},
+                        {"role": "user", "content": f"""
+Create {num_outfits} outfit plans as a JSON LIST. Use these exact categories only:
+{categories}
+
+Constraints:
+- Event: {event}
+- Total budget (EUR): {budget}
+- Style/brand hints: {style_prefs}
+
+Output example (LIST):
+[
+  {{"Tops": "white oxford shirt, slim fit", "Bottoms": "navy tailored trousers", "Shoes": "black leather oxford shoes"}}
+]
+"""}
+                    ],
+                    temperature=0.5,
+                )
+                raw = resp.choices[0].message.content.strip()
             except Exception:
-                pass
-        return None
+                # Older SDKs: try module-level call; still fully optional
+                raw = None
 
-    def call_llm_plan(num_outfits, articles, cats, text_query, tier, budget, brand_hint):
-        """LLM shapes retrieval queries (if OPENAI_API_KEY exists)."""
-        system = (
-            "You are an outfit-planning assistant. Output ONLY valid JSON. "
-            "Structure: {\"outfits\": [ [ {\"category\":\"Tops\",\"query\":\"short retrieval query\"}, ... ], ... ] }."
-        )
-        user = textwrap.dedent(f"""
-            num_outfits: {num_outfits}
-            articles_per_outfit: {articles}
-            categories_order: {cats}
-            user_text_query: \"{text_query}\"
-            budget_tier: {tier}
-            total_budget_eur: {budget}
-            brand_hint: \"{brand_hint}\"
-
-            For each outfit produce concise retrieval queries (1-6 words) that combine the user's text_query + category + style hints.
-        """)
-        try:
-            import openai
-            openai.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
-            if not openai.api_key:
+            if not raw:
                 return None
-            resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.15,
-                max_tokens=400,
-                n=1,
-                timeout=10,
-            )
-            text = resp["choices"][0]["message"]["content"]
-            parsed = try_parse_json(text)
-            return parsed
+
+            # Parse + canonicalize
+            data = json.loads(raw)
+            if isinstance(data, dict) and "outfits" in data:
+                data = data["outfits"]
+            if isinstance(data, dict):
+                data = [data]
+
+            plans = []
+            for outfit in (data or []):
+                if not isinstance(outfit, dict):
+                    continue
+                plan = {}
+                for k, v in outfit.items():
+                    cat = canonicalize_category(k) or k
+                    if cat in categories:
+                        plan[cat] = v if isinstance(v, str) else " ".join(v) if isinstance(v, list) else str(v)
+                # Ensure we only keep requested categories in order
+                plan = {c: plan.get(c, f"{event} {c} {style_prefs or ''}".strip()) for c in categories}
+                plans.append(plan)
+            return plans or None
         except Exception:
             return None
-
-    def lm_fallback_plan(num_outfits, articles, cats, text_query, tier, budget, brand_hint):
-        outfits = []
-        for _ in range(num_outfits):
-            items = []
-            for c in cats:
-                q = f"{text_query} {c}".strip()
-                if brand_hint:
-                    q += f" {brand_hint}"
-                items.append({"category": c, "query": q})
-            outfits.append(items)
-        return {"outfits": outfits}
 
     def compute_category_caps(cats_in_outfit, total_budget):
         weights = []
         for c in cats_in_outfit:
-            w = OUTFIT_WEIGHTS.get(c, None)
+            w = OUTFIT_WEIGHTS.get(c)
             weights.append(w if w is not None else 1.0)
         s = sum(weights) or 1.0
-        caps = {c: float(total_budget * (w / s)) for c, w in zip(cats_in_outfit, weights)}
-        return caps
+        return {c: float(total_budget * (w / s)) for c, w in zip(cats_in_outfit, weights)}
 
-    def pick_best_from_candidates(objs, cap_price):
-        if not objs:
-            return None
-        valid = []
-        for o in objs:
-            try:
-                p = float((o.properties or {}).get("price", 0) or 0)
-            except Exception:
-                p = 0.0
-            valid.append((o, p))
-        under = [o for o, pr in valid if pr <= (cap_price if cap_price is not None else 1e12)]
-        if under:
-            return under[0]
-        valid.sort(key=lambda x: x[1])
-        return valid[0][0]
+    def normalize_price(x) -> float:
+        try:
+            if x is None:
+                return 0.0
+            if isinstance(x, (int, float)):
+                return float(x)
+            # strip currency symbols if any
+            return float(str(x).replace("€", "").replace("$", "").replace(",", "").strip())
+        except Exception:
+            return 0.0
+
+    def score_rank_order(index: int, total: int) -> float:
+        # Simple rank-based score: top=1.0 → 0.0
+        if total <= 1:
+            return 1.0
+        return 1.0 - (index / (total - 1))
 
     # Main composition flow
     if build_btn:
+        # Categories to include based on slider (stable & canonical)
         cats = OUTFIT_ORDER_BY_N[5 if articles >= 5 else articles]
-        plan = call_llm_plan(num_outfits, articles, cats, text_query, selected_tier, max_outfit_budget, brand_filter.strip())
-        if not plan or "outfits" not in plan:
-            plan = lm_fallback_plan(num_outfits, articles, cats, text_query, selected_tier, max_outfit_budget, brand_filter.strip())
+
+        # Try LLM; fall back to deterministic local planner that guarantees canonical keys
+        plan = call_llm_plan_safe(
+            event=text_query,
+            categories=cats,
+            budget=max_outfit_budget,
+            style_prefs=brand_filter.strip(),
+            num_outfits=num_outfits,
+        ) or lm_fallback_plan(num_outfits, cats, text_query, brand_filter)
 
         all_outfits = []
+        valid_outfits = []
+        near_misses = []  # best over-budget picks to show if nothing fits
         used_ids = set()
+
         t0 = time.time()
-        with st.spinner("LLM planning + retrieval + reranking…"):
-            for outfit_idx, outfit_spec in enumerate(plan["outfits"][:num_outfits]):
-                chosen = []
-                total_price = 0.0
-                cats_in_this = [it.get("category") for it in outfit_spec]
+        with st.spinner("Composing outfits…"):
+            for outfit_idx in range(min(num_outfits, len(plan))):
+                outfit_plan = plan[outfit_idx]  # dict: { "Tops": "...", ... }
+                cats_in_this = list(outfit_plan.keys())
                 caps = compute_category_caps(cats_in_this, max_outfit_budget)
 
-                for item in outfit_spec:
-                    cat = item.get("category")
-                    q = item.get("query") or f"{text_query} {cat}"
-                    f = build_category_filters(cat)
-
+                # --- parallel retrieval per category ---
+                def _retrieve_for_cat(cat_and_query):
+                    cat, query_text_local = cat_and_query
+                    # Tighten filter with per-category cap
+                    f = build_category_filters(cat, extra_price_cap=caps.get(cat))
+                    # Important: pass text_vec=None so BM25 matches THIS query string
                     objs = do_hybrid_search(
                         client=client,
-                        text_query=q,
-                        text_vec=text_vec,
-                        image_vec=image_vec,
+                        text_query=query_text_local,
+                        text_vec=None,
+                        image_vec=None,
                         alpha=0.0,
-                        limit=max(3, per_cat_candidates),
+                        limit=max(6, per_cat_candidates * 2),
                         offset=0,
                         filters=f,
                     )
-                    objs = [o for o in objs if o.uuid not in used_ids]
                     if not objs:
-                        continue
-
+                        return cat, []
+                    # Rerank: image-aware if provided; else lightweight text rerank
                     if uploaded_image:
-                        reranked = fashionclip_rerank(objs[:min(len(objs), max(8, topk_for_rerank))], q, uploaded_image)
+                        reranked = fashionclip_rerank(
+                            objs[:min(len(objs), max(8, per_cat_candidates * 2))],
+                            query_text_local,
+                            uploaded_image,
+                        )
                     else:
-                        reranked = lightweight_rerank(objs[:min(len(objs), max(8, topk_for_rerank))], q, None)
+                        reranked = lightweight_rerank(
+                            objs[:min(len(objs), max(8, per_cat_candidates * 2))],
+                            query_text_local,
+                            None,
+                        )
+                    # Keep top per_cat_candidates and drop used IDs
+                    filtered = [o for o in reranked if o.uuid not in used_ids][:per_cat_candidates]
+                    return cat, filtered
 
-                    cap = caps.get(cat)
-                    pick = pick_best_from_candidates(reranked, cap)
-                    if pick:
-                        chosen.append(pick)
-                        used_ids.add(pick.uuid)
-                        try:
-                            price = float((pick.properties or {}).get("price", 0) or 0)
-                        except Exception:
-                            price = 0.0
-                        total_price += price
+                cat_queries = [(c, (outfit_plan.get(c) or f"{text_query} {c} {brand_filter}".strip())) for c in cats_in_this]
 
-                all_outfits.append((chosen, total_price))
+                candidates_map = {}
+                with ThreadPoolExecutor(max_workers=min(8, len(cat_queries))) as ex:
+                    futures = [ex.submit(_retrieve_for_cat, cq) for cq in cat_queries]
+                    for fut in as_completed(futures):
+                        cat, cand = fut.result()
+                        candidates_map[cat] = cand
+
+                # If any category completely failed, skip this outfit attempt
+                if any(len(candidates_map.get(c, [])) == 0 for c in cats_in_this):
+                    continue
+
+                # --- choose best combo under the global budget ---
+                # Build lists in the fixed category order to keep consistency
+                cand_lists = [candidates_map[c] for c in cats_in_this]
+                sizes = [len(lst) for lst in cand_lists]
+                # Bounded product: at worst 10^5=100k (but UI slider caps at 10)
+                best_combo = None
+                best_score = -1e9
+                best_price = 1e12
+
+                def item_price(o):
+                    return normalize_price((o.properties or {}).get("price", 0))
+
+                # Pre-compute rank-based scores per category list
+                rank_scores = []
+                for lst in cand_lists:
+                    n = max(1, len(lst))
+                    rank_scores.append({o.uuid: score_rank_order(i, n) for i, o in enumerate(lst)})
+
+                for combo in itertools.product(*cand_lists):
+                    # Ensure no duplicates across categories (paranoid; usually distinct)
+                    uuids = {o.uuid for o in combo}
+                    if len(uuids) < len(combo):
+                        continue
+                    total_price = sum(item_price(o) for o in combo)
+
+                    # Score: sum rank-based, lightly penalize price pressure vs cat cap
+                    score = 0.0
+                    for cat, o in zip(cats_in_this, combo):
+                        s_rank = rank_scores[cats_in_this.index(cat)][o.uuid]
+                        cap = caps.get(cat) or (max_outfit_budget / len(cats_in_this))
+                        s_price_penalty = 0.02 * (item_price(o) / max(1.0, cap))
+                        score += (s_rank - s_price_penalty)
+
+                    if total_price <= max_outfit_budget:
+                        # Prefer higher score; tie-break on lower price
+                        if (score > best_score) or (score == best_score and total_price < best_price):
+                            best_score = score
+                            best_combo = combo
+                            best_price = total_price
+
+                if best_combo is None:
+                    # No combo under budget; pick the best overall (min overage)
+                    best_over = None
+                    best_over_gap = 1e12
+                    best_over_score = -1e9
+                    for combo in itertools.product(*cand_lists):
+                        uuids = {o.uuid for o in combo}
+                        if len(uuids) < len(combo):
+                            continue
+                        total_price = sum(item_price(o) for o in combo)
+                        gap = total_price - max_outfit_budget
+                        # reuse score calc
+                        score = 0.0
+                        for cat, o in zip(cats_in_this, combo):
+                            s_rank = rank_scores[cats_in_this.index(cat)][o.uuid]
+                            cap = caps.get(cat) or (max_outfit_budget / len(cats_in_this))
+                            s_price_penalty = 0.02 * (item_price(o) / max(1.0, cap))
+                            score += (s_rank - s_price_penalty)
+                        if gap < best_over_gap or (gap == best_over_gap and score > best_over_score):
+                            best_over_gap = gap
+                            best_over_score = score
+                            best_over = (combo, total_price)
+
+                    if best_over:
+                        combo, total_price = best_over
+                        near_misses.append((list(combo), total_price))
+                        # Still reserve IDs to reduce duplication in subsequent outfits
+                        for o in combo:
+                            used_ids.add(o.uuid)
+                        all_outfits.append((list(combo), total_price))
+                    continue
+
+                # Record best valid outfit, mark items as used
+                final_list = list(best_combo)
+                for o in final_list:
+                    used_ids.add(o.uuid)
+                valid_outfits.append((final_list, best_price))
+                all_outfits.append((final_list, best_price))
 
         took = (time.time() - t0) * 1000
 
-        # enforce total-budget display filter (only show outfits that actually fit)
-        valid_outfits = [(p, t) for p, t in all_outfits if t <= max_outfit_budget]
-        over_count = len(all_outfits) - len(valid_outfits)
-
-        st.caption(f"Generated {len(all_outfits)} outfit(s) in {took:.0f} ms (LLM-assisted)")
-        if over_count > 0:
-            st.warning(f"{over_count} outfit(s) exceeded total budget and were omitted. Try increasing budget or relaxing constraints.")
-
-        if not valid_outfits:
-            st.info("Couldn’t compose outfits within budget. Try a different tier, increase the budget, or relax filters.")
+        st.caption(f"Composed {len(all_outfits)} outfit(s) in {took:.0f} ms")
+        if not valid_outfits and near_misses:
+            st.warning("No outfit fit the budget exactly. Showing the closest matches over budget.")
+            # Show up to 2 near-misses
+            for idx, (pieces, tot_price) in enumerate(sorted(near_misses, key=lambda x: x[1])[:2], start=1):
+                st.subheader(f"Near-match {idx} — Total: €{tot_price:.0f} (budget €{max_outfit_budget})")
+                cols = st.columns(max(2, len(pieces)))
+                for i, obj in enumerate(pieces):
+                    with cols[i % len(cols)]:
+                        result_cards([obj], cols=1, add_to_seen=False)
+                st.divider()
+        elif not valid_outfits:
+            st.info("Couldn’t compose outfits. Try increasing the budget, switching tier, or widening brand hints.")
         else:
             for idx, (pieces, tot_price) in enumerate(valid_outfits, start=1):
                 st.subheader(f"Outfit {idx} — Total: €{tot_price:.0f} (budget ≤ €{max_outfit_budget})")
@@ -722,6 +852,7 @@ else:
                     with cols[i % len(cols)]:
                         result_cards([obj], cols=1, add_to_seen=False)
                 st.divider()
+
 
 # =============================================================
 # Footer & Debug
