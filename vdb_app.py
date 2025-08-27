@@ -436,7 +436,7 @@ topk_for_rerank = st.sidebar.slider("Rerank top-k", 10, 100, 40, 5)
 # Outfit budget controls
 st.sidebar.markdown("---")
 selected_tier = st.sidebar.selectbox("Budget tier", ["Budget", "Mid", "Premium", "Luxury"], index=1)
-max_outfit_budget = st.sidebar.number_input("Total outfit budget (EUR)", min_value=30, max_value=5000, value=350)
+user_budget = st.sidebar.number_input("Budget (EUR)", min_value=10, max_value=5000, value=350)
 
 # For Single Items only (kept for backwards-compat debug)
 limit = st.sidebar.slider("Results per batch", 4, 24, 12, 1)
@@ -466,11 +466,22 @@ text_vec = embed_text_cached(text_query) if text_query.strip() and search_type i
 image_vec = embed_image_cached(uploaded_image) if uploaded_image and search_type in ("Image", "Text + Image") else None
 
 # Build filters for single items (category filter comes from sidebar)
+price_min, price_max = None, None
+if selected_categories and len(selected_categories) == 1 and selected_categories[0] in BUDGET_TIERS:
+    cat = selected_categories[0]
+    price_min, price_max = BUDGET_TIERS[cat][selected_tier]
+    if user_budget:
+        price_max = min(price_max, user_budget) if price_max else user_budget
+else:
+    # no category or multiple categories → just cap by user budget
+    if user_budget:
+        price_max = user_budget
+
 filters_single = build_filters(
     gender=None if gender == "any" else gender,
     categories=selected_categories,
-    price_min=None,
-    price_max=None,
+    price_min=price_min,
+    price_max=price_max,
     brand_substr=brand_filter.strip() or None,
     exclude_ids=list(st.session_state.seen_ids) if st.session_state.seen_ids else None,
 )
@@ -481,7 +492,7 @@ sig = signature_for_query(mode, text_query, uploaded_image is not None, {
     "cats": tuple(selected_categories),
     "brand": brand_filter,
     "tier": selected_tier,
-    "outfit_budget": max_outfit_budget,
+    "outfit_budget": user_budget,
 })
 if sig != st.session_state.last_query_sig:
     st.session_state.last_query_sig = sig
@@ -493,6 +504,13 @@ client = get_client()
 # =============================================================
 # Mode: Single Items
 # =============================================================
+def get_tier_from_budget(category, budget):
+    if category not in BUDGET_TIERS:
+        return None, None, None
+    for tier, (lo, hi) in BUDGET_TIERS[category].items():
+        if (budget >= lo) and (hi is None or budget <= hi):
+            return tier, lo, hi
+    return None, None, None
 
 if mode == "Single Items":
     c1, c2 = st.columns([3,1])
@@ -502,6 +520,14 @@ if mode == "Single Items":
         refine = st.button("Refine (no repeats)")
 
     if run or refine:
+        # --- Budget sanity check vs tier ---
+        if selected_categories and len(selected_categories) == 1:
+            cat = selected_categories[0]
+            tier, lo, hi = get_tier_from_budget(cat, user_budget)
+            if tier is None:
+                st.warning(f"⚠️ No results under €{user_budget} for {cat}. Try raising budget.")
+            else:
+                st.caption(f"🎯 Your budget €{user_budget} falls in the {tier} tier for {cat}.")
         if refine:
             st.session_state.offset += limit
         t0 = time.time()
@@ -686,7 +712,7 @@ Output example (LIST):
         plan = call_llm_plan_safe(
             event=text_query,
             categories=cats,
-            budget=max_outfit_budget,
+            budget=user_budget,
             style_prefs=brand_filter.strip(),
             num_outfits=num_outfits,
         ) or lm_fallback_plan(num_outfits, cats, text_query, brand_filter)
@@ -701,7 +727,7 @@ Output example (LIST):
             for outfit_idx in range(min(num_outfits, len(plan))):
                 outfit_plan = plan[outfit_idx]  # dict: { "Tops": "...", ... }
                 cats_in_this = list(outfit_plan.keys())
-                caps = compute_category_caps(cats_in_this, max_outfit_budget)
+                caps = compute_category_caps(cats_in_this, user_budget)
 
                 # --- parallel retrieval per category ---
                 def _retrieve_for_cat(cat_and_query):
@@ -780,11 +806,11 @@ Output example (LIST):
                     score = 0.0
                     for cat, o in zip(cats_in_this, combo):
                         s_rank = rank_scores[cats_in_this.index(cat)][o.uuid]
-                        cap = caps.get(cat) or (max_outfit_budget / len(cats_in_this))
+                        cap = caps.get(cat) or (user_budget / len(cats_in_this))
                         s_price_penalty = 0.02 * (item_price(o) / max(1.0, cap))
                         score += (s_rank - s_price_penalty)
 
-                    if total_price <= max_outfit_budget:
+                    if total_price <= user_budget:
                         # Prefer higher score; tie-break on lower price
                         if (score > best_score) or (score == best_score and total_price < best_price):
                             best_score = score
@@ -801,12 +827,12 @@ Output example (LIST):
                         if len(uuids) < len(combo):
                             continue
                         total_price = sum(item_price(o) for o in combo)
-                        gap = total_price - max_outfit_budget
+                        gap = total_price - user_budget
                         # reuse score calc
                         score = 0.0
                         for cat, o in zip(cats_in_this, combo):
                             s_rank = rank_scores[cats_in_this.index(cat)][o.uuid]
-                            cap = caps.get(cat) or (max_outfit_budget / len(cats_in_this))
+                            cap = caps.get(cat) or (user_budget / len(cats_in_this))
                             s_price_penalty = 0.02 * (item_price(o) / max(1.0, cap))
                             score += (s_rank - s_price_penalty)
                         if gap < best_over_gap or (gap == best_over_gap and score > best_over_score):
@@ -837,7 +863,7 @@ Output example (LIST):
             st.warning("No outfit fit the budget exactly. Showing the closest matches over budget.")
             # Show up to 2 near-misses
             for idx, (pieces, tot_price) in enumerate(sorted(near_misses, key=lambda x: x[1])[:2], start=1):
-                st.subheader(f"Near-match {idx} — Total: €{tot_price:.0f} (budget €{max_outfit_budget})")
+                st.subheader(f"Near-match {idx} — Total: €{tot_price:.0f} (budget €{user_budget})")
                 cols = st.columns(max(2, len(pieces)))
                 for i, obj in enumerate(pieces):
                     with cols[i % len(cols)]:
@@ -847,7 +873,7 @@ Output example (LIST):
             st.info("Couldn’t compose outfits. Try increasing the budget, switching tier, or widening brand hints.")
         else:
             for idx, (pieces, tot_price) in enumerate(valid_outfits, start=1):
-                st.subheader(f"Outfit {idx} — Total: €{tot_price:.0f} (budget ≤ €{max_outfit_budget})")
+                st.subheader(f"Outfit {idx} — Total: €{tot_price:.0f} (budget ≤ €{user_budget})")
                 cols = st.columns(max(2, len(pieces)))
                 for i, obj in enumerate(pieces):
                     with cols[i % len(cols)]:
